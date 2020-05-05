@@ -15,7 +15,7 @@ STATUS createIceAgent(PCHAR username, PCHAR password, PIceAgentCallbacks pIceAge
 
     STATUS retStatus = STATUS_SUCCESS;
     PIceAgent pIceAgent = NULL;
-    UINT32 i, turnServerCount = 0;
+    UINT32 i;
 
     CHK(ppIceAgent != NULL && username != NULL && password != NULL && pConnectionListener != NULL, STATUS_NULL_ARG);
     CHK(STRNLEN(username, MAX_ICE_CONFIG_USER_NAME_LEN + 1) <= MAX_ICE_CONFIG_USER_NAME_LEN &&
@@ -30,6 +30,7 @@ STATUS createIceAgent(PCHAR username, PCHAR password, PIceAgentCallbacks pIceAge
     ATOMIC_STORE_BOOL(&pIceAgent->remoteCredentialReceived, FALSE);
     ATOMIC_STORE_BOOL(&pIceAgent->agentStartGathering, FALSE);
     ATOMIC_STORE_BOOL(&pIceAgent->candidateGatheringFinished, FALSE);
+    ATOMIC_STORE_BOOL(&pIceAgent->shutdown, FALSE);
     pIceAgent->isControlling = FALSE;
     pIceAgent->tieBreaker = (UINT64) RAND();
     pIceAgent->iceTransportPolicy = pRtcConfiguration->iceTransportPolicy;
@@ -50,7 +51,7 @@ STATUS createIceAgent(PCHAR username, PCHAR password, PIceAgentCallbacks pIceAge
     CHK_STATUS(createStateMachine(ICE_AGENT_STATE_MACHINE_STATES,
                                   ICE_AGENT_STATE_MACHINE_STATE_COUNT,
                                   (UINT64) pIceAgent,
-                                  kinesisVideoStreamDefaultGetCurrentTime,
+                                  iceAgentGetCurrentTime,
                                   (UINT64) pIceAgent,
                                   &pIceAgent->pStateMachine));
     pIceAgent->iceAgentStatus = STATUS_SUCCESS;
@@ -65,10 +66,7 @@ STATUS createIceAgent(PCHAR username, PCHAR password, PIceAgentCallbacks pIceAge
     CHK_STATUS(createTransactionIdStore(DEFAULT_MAX_STORED_TRANSACTION_ID_COUNT,
                                         &pIceAgent->pStunBindingRequestTransactionIdStore));
 
-    pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId = UINT32_MAX;
-    pIceAgent->turnConnectionTracker.freeTurnConnectionEndTime = INVALID_TIMESTAMP_VALUE;
-    pIceAgent->turnConnectionTracker.pTurnConnection = NULL;
-    pIceAgent->turnConnectionTracker.pRelayCandidate = NULL;
+    pIceAgent->turnConnectionTrackerCount = 0;
 
     CHK_STATUS(doubleListCreate(&pIceAgent->localCandidates));
     CHK_STATUS(doubleListCreate(&pIceAgent->remoteCandidates));
@@ -90,15 +88,6 @@ STATUS createIceAgent(PCHAR username, PCHAR password, PIceAgentCallbacks pIceAge
                                             (PCHAR) pRtcConfiguration->iceServers[i].username,
                                             (PCHAR) pRtcConfiguration->iceServers[i].credential))) {
             pIceAgent->iceServersCount++;
-
-            // use only one turn server for now
-            if (pIceAgent->iceServers[pIceAgent->iceServersCount - 1].isTurn) {
-                if (turnServerCount == 0) {
-                    turnServerCount++;
-                } else {
-                    pIceAgent->iceServersCount--;
-                }
-            }
         }
     }
 
@@ -245,6 +234,9 @@ STATUS iceAgentReportNewLocalCandidate(PIceAgent pIceAgent, PIceCandidate pIceCa
     UINT32 serializedIceCandidateBufLen = ARRAY_SIZE(serializedIceCandidateBuf);
 
     CHK(pIceAgent != NULL && pIceCandidate != NULL, STATUS_NULL_ARG);
+
+    iceAgentLogNewCandidate(pIceCandidate);
+
     CHK_WARN(pIceAgent->iceAgentCallbacks.newLocalCandidateFn != NULL, retStatus, "newLocalCandidateFn callback not implemented");
     CHK_WARN(!ATOMIC_LOAD_BOOL(&pIceAgent->candidateGatheringFinished), retStatus,
                      "Cannot report new ice candidate because candidate gathering is already finished");
@@ -266,8 +258,10 @@ STATUS iceAgentAddRemoteCandidate(PIceAgent pIceAgent, PCHAR pIceCandidateString
     BOOL locked = FALSE;
     PIceCandidate pIceCandidate = NULL, pDuplicatedIceCandidate = NULL;
     PCHAR curr, tail, next;
-    UINT32 tokenLen, portValue, remoteCandidateCount;
-    BOOL foundIpAndPort = FALSE, freeIceCandidateIfFail = TRUE;
+    UINT32 tokenLen, portValue, remoteCandidateCount, i, len;
+    BOOL freeIceCandidateIfFail = TRUE;
+    BOOL foundIp = FALSE, foundPort = FALSE;
+    CHAR ipBuf[KVS_IP_ADDRESS_STRING_BUFFER_LEN];
     KvsIpAddress candidateIpAddr;
 
     CHK(pIceAgent != NULL && pIceCandidateString != NULL, STATUS_NULL_ARG);
@@ -283,31 +277,39 @@ STATUS iceAgentAddRemoteCandidate(PIceAgent pIceAgent, PCHAR pIceCandidateString
 
     curr = pIceCandidateString;
     tail = pIceCandidateString + STRLEN(pIceCandidateString);
-    while ((next = STRNCHR(curr, tail - curr, ' ')) != NULL && !foundIpAndPort) {
+    while ((next = STRNCHR(curr, tail - curr, ' ')) != NULL && !(foundIp && foundPort)) {
         tokenLen = (UINT32) (next - curr);
         CHK(STRNCMPI("tcp", curr, tokenLen) != 0, STATUS_ICE_CANDIDATE_STRING_IS_TCP);
 
-        if (candidateIpAddr.address[0] != 0) {
+        if (foundIp) {
             CHK_STATUS(STRTOUI32(curr, curr + tokenLen, 10, &portValue));
 
             candidateIpAddr.port = htons(portValue);
-            candidateIpAddr.family = KVS_IP_FAMILY_TYPE_IPV4;
-        } else if (STRNCHR(curr, tokenLen, '.') != NULL) {
-            CHK(tokenLen <= KVS_MAX_IPV4_ADDRESS_STRING_LEN, STATUS_ICE_CANDIDATE_STRING_INVALID_IP); // IPv4 is 15 characters at most
-            CHK_STATUS(populateIpFromString(&candidateIpAddr, curr));
+            foundPort = TRUE;
+        } else {
+            len = MIN(next - curr, KVS_IP_ADDRESS_STRING_BUFFER_LEN - 1);
+            STRNCPY(ipBuf, curr, len);
+            ipBuf[len] = '\0';
+
+            if ((foundIp = inet_pton(AF_INET, ipBuf, candidateIpAddr.address) == 1 ? TRUE : FALSE)) {
+                candidateIpAddr.family = KVS_IP_FAMILY_TYPE_IPV4;
+            } else if ((foundIp = inet_pton(AF_INET6, ipBuf, candidateIpAddr.address) == 1 ? TRUE : FALSE)) {
+                candidateIpAddr.family = KVS_IP_FAMILY_TYPE_IPV6;
+            }
         }
 
         curr = next + 1;
-        foundIpAndPort = (candidateIpAddr.port != 0) && (candidateIpAddr.address[0] != 0);
     }
 
-    CHK(candidateIpAddr.port != 0, STATUS_ICE_CANDIDATE_STRING_MISSING_PORT);
-    CHK(candidateIpAddr.address[0] != 0, STATUS_ICE_CANDIDATE_STRING_MISSING_IP);
+    CHK(foundPort, STATUS_ICE_CANDIDATE_STRING_MISSING_PORT);
+    CHK(foundIp, STATUS_ICE_CANDIDATE_STRING_MISSING_IP);
 
     CHK_STATUS(findCandidateWithIp(&candidateIpAddr, pIceAgent->remoteCandidates, &pDuplicatedIceCandidate));
     CHK(pDuplicatedIceCandidate == NULL, retStatus);
 
     CHK((pIceCandidate = MEMCALLOC(1, SIZEOF(IceCandidate))) != NULL, STATUS_NOT_ENOUGH_MEMORY);
+    generateJSONSafeString(pIceCandidate->id, ARRAY_SIZE(pIceCandidate->id));
+    pIceCandidate->isRemote = TRUE;
     pIceCandidate->ipAddress = candidateIpAddr;
     pIceCandidate->state = ICE_CANDIDATE_STATE_VALID;
     CHK_STATUS(doubleListInsertItemHead(pIceAgent->remoteCandidates, (UINT64) pIceCandidate));
@@ -315,10 +317,12 @@ STATUS iceAgentAddRemoteCandidate(PIceAgent pIceAgent, PCHAR pIceCandidateString
 
     CHK_STATUS(createIceCandidatePairs(pIceAgent, pIceCandidate, TRUE));
 
-    // turnConnectionAddPeer only if turn is used
-    if (pIceAgent->turnConnectionTracker.pTurnConnection != NULL) {
-        CHK_STATUS(turnConnectionAddPeer(pIceAgent->turnConnectionTracker.pTurnConnection, &pIceCandidate->ipAddress));
+    /* pass remote candidate to each turnConnection */
+    for(i = 0; i < pIceAgent->turnConnectionTrackerCount; ++i) {
+        CHK_STATUS(turnConnectionAddPeer(pIceAgent->turnConnectionTrackers[i].pTurnConnection, &pIceCandidate->ipAddress));
     }
+
+    iceAgentLogNewCandidate(pIceCandidate);
 
 CleanUp:
 
@@ -353,11 +357,12 @@ STATUS iceAgentInitHostCandidate(PIceAgent pIceAgent)
         // make sure pIceAgent->localCandidates has no duplicates
         CHK_STATUS(findCandidateWithIp(pIpAddress, pIceAgent->localCandidates, &pDuplicatedIceCandidate));
 
-        if (pIpAddress->family == KVS_IP_FAMILY_TYPE_IPV4 && // Disable ipv6 gathering for now
-            pDuplicatedIceCandidate == NULL &&
+        if (pDuplicatedIceCandidate == NULL &&
             STATUS_SUCCEEDED(createSocketConnection(pIpAddress, NULL, KVS_SOCKET_PROTOCOL_UDP, (UINT64) pIceAgent,
                                                     incomingDataHandler, pIceAgent->kvsRtcConfiguration.sendBufSize, &pSocketConnection))) {
             pTmpIceCandidate = MEMCALLOC(1, SIZEOF(IceCandidate));
+            generateJSONSafeString(pTmpIceCandidate->id, ARRAY_SIZE(pTmpIceCandidate->id));
+            pTmpIceCandidate->isRemote = FALSE;
             pTmpIceCandidate->ipAddress = *pIpAddress;
             pTmpIceCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_HOST;
             pTmpIceCandidate->state = ICE_CANDIDATE_STATE_VALID;
@@ -386,7 +391,6 @@ STATUS iceAgentInitHostCandidate(PIceAgent pIceAgent)
             ATOMIC_STORE_BOOL(&pSocketConnection->receiveData, TRUE);
             // connectionListener will free the pSocketConnection at the end.
             CHK_STATUS(connectionListenerAddConnection(pIceAgent->pConnectionListener, pNewIceCandidate->pSocketConnection));
-            CHK_STATUS(iceAgentReportNewLocalCandidate(pIceAgent, pNewIceCandidate));
         }
     }
 
@@ -475,7 +479,7 @@ STATUS iceAgentStartGathering(PIceAgent pIceAgent)
         CHK_STATUS(iceAgentInitSrflxCandidate(pIceAgent));
     }
 
-    CHK_STATUS(iceAgentInitRelayCandidate(pIceAgent));
+    CHK_STATUS(iceAgentInitRelayCandidates(pIceAgent));
 
     // start listening for incoming data
     CHK_STATUS(connectionListenerStart(pIceAgent->pConnectionListener));
@@ -503,11 +507,8 @@ CleanUp:
 STATUS iceAgentSendPacket(PIceAgent pIceAgent, PBYTE pBuffer, UINT32 bufferLen)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    BOOL locked = FALSE;
-
-    SocketConnection socketConnection;
-    KvsIpAddress destAddr;
-    BOOL isRelay = FALSE;
+    BOOL locked = FALSE, isRelay = FALSE;
+    PTurnConnection pTurnConnection = NULL;
 
     CHK(pIceAgent != NULL && pBuffer != NULL, STATUS_NULL_ARG);
     CHK(bufferLen != 0, STATUS_INVALID_ARG);
@@ -515,24 +516,38 @@ STATUS iceAgentSendPacket(PIceAgent pIceAgent, PBYTE pBuffer, UINT32 bufferLen)
     MUTEX_LOCK(pIceAgent->lock);
     locked = TRUE;
 
+    /* Do not proceed if ice is shutting down */
+    CHK(!ATOMIC_LOAD_BOOL(&pIceAgent->shutdown), retStatus);
+    CHK(bufferLen != 0, STATUS_INVALID_ARG);
+
     CHK_WARN(pIceAgent->pDataSendingIceCandidatePair != NULL, retStatus, "No valid ice candidate pair available to send data");
+    CHK_WARN(pIceAgent->pDataSendingIceCandidatePair->state == ICE_CANDIDATE_PAIR_STATE_SUCCEEDED,
+             retStatus, "Invalid state for data sending candidate pair.");
 
     pIceAgent->pDataSendingIceCandidatePair->lastDataSentTime = GETTIME();
 
-    // Construct context
-    socketConnection = *pIceAgent->pDataSendingIceCandidatePair->local->pSocketConnection;
-    destAddr = pIceAgent->pDataSendingIceCandidatePair->remote->ipAddress;
     isRelay = IS_CANN_PAIR_SENDING_FROM_RELAYED(pIceAgent->pDataSendingIceCandidatePair);
+    if (isRelay) {
+        CHK_ERR(pIceAgent->pDataSendingIceCandidatePair->local->pTurnConnectionTracker != NULL,
+                STATUS_NULL_ARG, "Candidate is relay but pTurnConnectionTracker is NULL");
+        pTurnConnection = pIceAgent->pDataSendingIceCandidatePair->local->pTurnConnectionTracker->pTurnConnection;
+    }
 
     retStatus = iceUtilsSendData(pBuffer,
                                  bufferLen,
-                                 &destAddr,
-                                 &socketConnection,
-                                 pIceAgent->turnConnectionTracker.pTurnConnection,
+                                 &pIceAgent->pDataSendingIceCandidatePair->remote->ipAddress,
+                                 pIceAgent->pDataSendingIceCandidatePair->local->pSocketConnection,
+                                 pTurnConnection,
                                  isRelay);
 
     if (STATUS_FAILED(retStatus)) {
         DLOGW("iceUtilsSendData failed with 0x%08x", retStatus);
+
+        if (retStatus == STATUS_SOCKET_CONNECTION_CLOSED_ALREADY) {
+            DLOGW("IceAgent connection closed unexpectedly");
+            pIceAgent->iceAgentStatus = STATUS_SOCKET_CONNECTION_CLOSED_ALREADY;
+            pIceAgent->pDataSendingIceCandidatePair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+        }
         retStatus = STATUS_SUCCESS;
     }
 
@@ -584,11 +599,30 @@ CleanUp:
 STATUS iceAgentShutdown(PIceAgent pIceAgent)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    BOOL locked = FALSE;
+    BOOL locked = FALSE, turnShutdownCompleted = FALSE;
     PDoubleListNode pCurNode = NULL;
     PIceCandidate pLocalCandidate = NULL;
+    UINT32 i;
+    UINT64 turnShutdownTimeout;
+    const UINT64 shortSleep = 50 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
+    ATOMIC_STORE_BOOL(&pIceAgent->shutdown, TRUE);
+
+    if (pIceAgent->iceAgentStateTimerTask != UINT32_MAX) {
+        CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->iceAgentStateTimerTask, (UINT64) pIceAgent));
+        pIceAgent->iceAgentStateTimerTask = UINT32_MAX;
+    }
+
+    if (pIceAgent->keepAliveTimerTask != UINT32_MAX) {
+        CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->keepAliveTimerTask, (UINT64) pIceAgent));
+        pIceAgent->keepAliveTimerTask = UINT32_MAX;
+    }
+
+    if (pIceAgent->iceCandidateGatheringTimerTask != UINT32_MAX) {
+        CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->iceCandidateGatheringTimerTask, (UINT64) pIceAgent));
+        pIceAgent->iceCandidateGatheringTimerTask = UINT32_MAX;
+    }
 
     MUTEX_LOCK(pIceAgent->lock);
     locked = TRUE;
@@ -606,28 +640,35 @@ STATUS iceAgentShutdown(PIceAgent pIceAgent)
     MUTEX_UNLOCK(pIceAgent->lock);
     locked = FALSE;
 
-    if (pIceAgent->iceAgentStateTimerTask != UINT32_MAX) {
-        CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->iceAgentStateTimerTask, (UINT64) pIceAgent));
-        pIceAgent->iceAgentStateTimerTask = UINT32_MAX;
+    /* first pass trigger turn shutdown */
+    for(i = 0; i < pIceAgent->turnConnectionTrackerCount; ++i) {
+       CHK_STATUS(turnConnectionShutdown(pIceAgent->turnConnectionTrackers[i].pTurnConnection, 0));
     }
 
-    if (pIceAgent->keepAliveTimerTask != UINT32_MAX) {
-        CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->keepAliveTimerTask, (UINT64) pIceAgent));
-        pIceAgent->keepAliveTimerTask = UINT32_MAX;
-    }
-
-    // free turn allocation
-    if (pIceAgent->turnConnectionTracker.pTurnConnection != NULL) {
-        if (pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId != UINT32_MAX) {
-            CHK_STATUS(timerQueueCancelTimer(pIceAgent->timerQueueHandle, pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId,
-                                             (UINT64) &pIceAgent->turnConnectionTracker));
-            pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId = UINT32_MAX;
+    turnShutdownTimeout = GETTIME() + KVS_ICE_TURN_CONNECTION_SHUTDOWN_TIMEOUT;
+    while(!turnShutdownCompleted && GETTIME() < turnShutdownTimeout) {
+        turnShutdownCompleted = TRUE;
+        for(i = 0; i < pIceAgent->turnConnectionTrackerCount; ++i) {
+            if (!turnConnectionIsShutdownComplete(pIceAgent->turnConnectionTrackers[i].pTurnConnection)) {
+                turnShutdownCompleted = FALSE;
+            }
         }
-        CHK_STATUS(turnConnectionShutdown(pIceAgent->turnConnectionTracker.pTurnConnection, KVS_ICE_TURN_CONNECTION_SHUTDOWN_TIMEOUT));
-        CHK_LOG_ERR(freeTurnConnection(&pIceAgent->turnConnectionTracker.pTurnConnection));
+
+        THREAD_SLEEP(shortSleep);
     }
 
-    // remove all connections first so no more incoming packets
+    if (!turnShutdownCompleted) {
+        DLOGW("TurnConnection shutdown did not complete within %u seconds",
+              KVS_ICE_TURN_CONNECTION_SHUTDOWN_TIMEOUT / HUNDREDS_OF_NANOS_IN_A_SECOND);
+    }
+
+    /* second pass free TurnConnection */
+    for(i = 0; i < pIceAgent->turnConnectionTrackerCount; ++i) {
+        CHK_LOG_ERR(freeTurnConnection(&pIceAgent->turnConnectionTrackers[i].pTurnConnection));
+    }
+    pIceAgent->turnConnectionTrackerCount = 0;
+
+    /* remove connections last because still need to send data to deallocate turn */
     if (pIceAgent->pConnectionListener != NULL) {
         CHK_STATUS(connectionListenerRemoveAllConnection(pIceAgent->pConnectionListener));
     }
@@ -745,7 +786,10 @@ STATUS createIceCandidatePairs(PIceAgent pIceAgent, PIceCandidate pIceCandidate,
         pCurrentIceCandidate = (PIceCandidate) data;
         pCurNode = pCurNode->pNext;
 
-        if (pCurrentIceCandidate->state == ICE_CANDIDATE_STATE_VALID) {
+        // https://tools.ietf.org/html/rfc8445#section-6.1.2.2
+        // pair local and remote candidates with the same family
+        if (pCurrentIceCandidate->state == ICE_CANDIDATE_STATE_VALID &&
+                pCurrentIceCandidate->ipAddress.family == pIceCandidate->ipAddress.family) {
             pIceCandidatePair = (PIceCandidatePair) MEMCALLOC(1, SIZEOF(IceCandidatePair));
             CHK(pIceCandidatePair != NULL, STATUS_NOT_ENOUGH_MEMORY);
 
@@ -763,6 +807,8 @@ STATUS createIceCandidatePairs(PIceAgent pIceAgent, PIceCandidate pIceCandidate,
 
             CHK_STATUS(createTransactionIdStore(DEFAULT_MAX_STORED_TRANSACTION_ID_COUNT,
                                                 &pIceCandidatePair->pTransactionIdStore));
+            CHK_STATUS(hashTableCreateWithParams(ICE_HASH_TABLE_BUCKET_COUNT, ICE_HASH_TABLE_BUCKET_LENGTH,
+                                                 &pIceCandidatePair->requestSentTime));
 
             pIceCandidatePair->lastDataSentTime = 0;
             pIceCandidatePair->priority = computeCandidatePairPriority(
@@ -797,6 +843,7 @@ STATUS freeIceCandidatePair(PIceCandidatePair* ppIceCandidatePair)
     pIceCandidatePair = *ppIceCandidatePair;
 
     CHK_LOG_ERR(freeTransactionIdStore(&pIceCandidatePair->pTransactionIdStore));
+    CHK_LOG_ERR(hashTableFree(pIceCandidatePair->requestSentTime));
     SAFE_MEMFREE(pIceCandidatePair);
 
 CleanUp:
@@ -916,6 +963,7 @@ STATUS iceCandidatePairCheckConnection(PStunPacket pStunBindingRequest, PIceAgen
 {
     STATUS retStatus = STATUS_SUCCESS;
     PStunAttributePriority pStunAttributePriority = NULL;
+    UINT32 checkSum = 0;
 
     CHK(pStunBindingRequest != NULL && pIceAgent != NULL && pIceCandidatePair != NULL, STATUS_NULL_ARG);
 
@@ -926,9 +974,10 @@ STATUS iceCandidatePairCheckConnection(PStunPacket pStunBindingRequest, PIceAgen
     pStunAttributePriority->priority = pIceCandidatePair->local->priority;
     CHK_STATUS(iceUtilsGenerateTransactionId(pStunBindingRequest->header.transactionId,
                                      ARRAY_SIZE(pStunBindingRequest->header.transactionId)));
-
     CHK(pIceCandidatePair->pTransactionIdStore != NULL, STATUS_INVALID_OPERATION);
     transactionIdStoreInsert(pIceCandidatePair->pTransactionIdStore, pStunBindingRequest->header.transactionId);
+    checkSum = COMPUTE_CRC32(pStunBindingRequest->header.transactionId, ARRAY_SIZE(pStunBindingRequest->header.transactionId));
+    CHK_STATUS(hashTableUpsert(pIceCandidatePair->requestSentTime, checkSum, GETTIME()));
 
     CHK_STATUS(iceAgentSendStunPacket(pStunBindingRequest,
                                       (PBYTE) pIceAgent->remotePassword,
@@ -948,24 +997,26 @@ STATUS iceAgentSendStunPacket(PStunPacket pStunPacket, PBYTE password, UINT32 pa
                               PIceCandidate pLocalCandidate, PKvsIpAddress pDestAddr)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    UINT32 stunPacketSize = STUN_PACKET_ALLOCATION_SIZE;
-    BYTE stunPacketBuffer[STUN_PACKET_ALLOCATION_SIZE];
     PIceCandidatePair pIceCandidatePair = NULL;
+    PTurnConnection pTurnConnection = NULL;
 
     // Assuming holding pIceAgent->lock
 
     CHK(pStunPacket != NULL && pIceAgent != NULL && pLocalCandidate != NULL && pDestAddr != NULL, STATUS_NULL_ARG);
 
-    CHK_STATUS(iceUtilsPackageStunPacket(pStunPacket, password, passwordLen, stunPacketBuffer, &stunPacketSize));
-    retStatus = iceUtilsSendData((PBYTE) stunPacketBuffer,
-                                 stunPacketSize,
-                                 pDestAddr,
-                                 pLocalCandidate->pSocketConnection,
-                                 pIceAgent->turnConnectionTracker.pTurnConnection,
-                                 pLocalCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_RELAYED);
+    pTurnConnection = pLocalCandidate->pTurnConnectionTracker != NULL ? pLocalCandidate->pTurnConnectionTracker->pTurnConnection : NULL;
+    retStatus = iceUtilsSendStunPacket(pStunPacket, password, passwordLen, pDestAddr,
+                                       pLocalCandidate->pSocketConnection, pTurnConnection,
+                                       pLocalCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_RELAYED);
 
     if (STATUS_FAILED(retStatus)) {
-        DLOGW("iceUtilsSendData failed with 0x%08x. Mark candidate pair as failed.", retStatus);
+        DLOGW("iceUtilsSendStunPacket failed with 0x%08x", retStatus);
+
+        if (retStatus == STATUS_SOCKET_CONNECTION_CLOSED_ALREADY) {
+            pLocalCandidate->state = ICE_CANDIDATE_STATE_INVALID;
+            iceAgentInvalidateCandidatePair(pIceAgent);
+        }
+
         retStatus = STATUS_SUCCESS;
 
         /* Update iceCandidatePair state to failed.
@@ -973,6 +1024,7 @@ STATUS iceAgentSendStunPacket(PStunPacket pStunPacket, PBYTE password, UINT32 pa
         CHK_STATUS(findIceCandidatePairWithLocalSocketConnectionAndRemoteAddr(pIceAgent, pLocalCandidate->pSocketConnection, pDestAddr, TRUE, &pIceCandidatePair));
 
         if (pIceCandidatePair != NULL) {
+            DLOGD("mark candidate pair %s_%s as failed", pIceCandidatePair->local->id, pIceCandidatePair->remote->id);
             pIceCandidatePair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
         }
     }
@@ -1043,20 +1095,12 @@ STATUS iceAgentSendSrflxCandidateRequest(PIceAgent pIceAgent)
             switch(pCandidate->iceCandidateType) {
                 case ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE:
                     pIceServer = &(pIceAgent->iceServers[pCandidate->iceServerIndex]);
-                    transactionIdStoreInsert(pIceAgent->pStunBindingRequestTransactionIdStore,
-                                             pBindingRequest->header.transactionId);
-                    retStatus =  iceUtilsSendStunPacket(pBindingRequest,
-                                                        NULL,
-                                                        0,
-                                                        &pIceServer->ipAddress,
-                                                        pCandidate->pSocketConnection,
-                                                        NULL,
-                                                        FALSE);
-                    if (STATUS_FAILED(retStatus)) {
-                        DLOGD("iceUtilsSendStunPacket failed with 0x%08x", retStatus);
-                        retStatus = STATUS_SUCCESS;
+                    if (pIceServer->ipAddress.family == pCandidate->ipAddress.family) {
+                        transactionIdStoreInsert(pIceAgent->pStunBindingRequestTransactionIdStore,
+                                                 pBindingRequest->header.transactionId);
+                        CHK_STATUS(iceAgentSendStunPacket(pBindingRequest, NULL, 0, pIceAgent, pCandidate,
+                                                          &pIceServer->ipAddress));
                     }
-
                     break;
 
                 default:
@@ -1174,53 +1218,25 @@ CleanUp:
     return retStatus;
 }
 
-STATUS iceAgentFreeTurnConnectionTimerCallback(UINT32 timerId, UINT64 currentTime, UINT64 customData)
-{
-    UNUSED_PARAM(timerId);
-    STATUS retStatus = STATUS_SUCCESS;
-    PTurnConnectionTracker pTurnConnectionTracker = (PTurnConnectionTracker) customData;
-
-    CHK(pTurnConnectionTracker != NULL, STATUS_NULL_ARG);
-
-    if (turnConnectionIsShutdownComplete(pTurnConnectionTracker->pTurnConnection) ||
-            currentTime > pTurnConnectionTracker->freeTurnConnectionEndTime) {
-        freeTurnConnection(&pTurnConnectionTracker->pTurnConnection);
-        pTurnConnectionTracker->pTurnConnection = NULL;
-        pTurnConnectionTracker->freeTurnConnectionTimerId = UINT32_MAX;
-        retStatus = STATUS_TIMER_QUEUE_STOP_SCHEDULING;
-    }
-
-CleanUp:
-
-    return retStatus;
-}
-
 STATUS iceAgentGatherCandidateTimerCallback(UINT32 timerId, UINT64 currentTime, UINT64 customData)
 {
     UNUSED_PARAM(timerId);
     STATUS retStatus = STATUS_SUCCESS;
+    IceCandidate newLocalCandidates[KVS_ICE_MAX_NEW_LOCAL_CANDIDATES_TO_REPORT_AT_ONCE];
+    UINT32 newLocalCandidateCount = 0;
     PIceAgent pIceAgent = (PIceAgent) customData;
     BOOL locked = FALSE, stopScheduling = FALSE;
     PDoubleListNode pCurNode = NULL;
     UINT64 data;
     PIceCandidate pIceCandidate = NULL;
-    UINT32 pendingSrflxCandidateCount = 0, pendingCandidateCount = 0;
+    UINT32 pendingSrflxCandidateCount = 0, pendingCandidateCount = 0, i;
     PKvsIpAddress pRelayAddress = NULL;
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
+    MEMSET(newLocalCandidates, 0x00, SIZEOF(newLocalCandidates));
 
     MUTEX_LOCK(pIceAgent->lock);
     locked = TRUE;
-
-    // Check if any relay address has been obtained.
-    if (pIceAgent->turnConnectionTracker.pRelayCandidate != NULL &&
-        pIceAgent->turnConnectionTracker.pRelayCandidate->state == ICE_CANDIDATE_STATE_NEW &&
-        (pRelayAddress = turnConnectionGetRelayAddress(pIceAgent->turnConnectionTracker.pTurnConnection)) != NULL) {
-
-        CHK_STATUS(updateCandidateAddress(pIceAgent->turnConnectionTracker.pRelayCandidate, pRelayAddress));
-        CHK_STATUS(iceAgentReportNewLocalCandidate(pIceAgent, pIceAgent->turnConnectionTracker.pRelayCandidate));
-        CHK_STATUS(createIceCandidatePairs(pIceAgent, pIceAgent->turnConnectionTracker.pRelayCandidate, FALSE));
-    }
 
     CHK_STATUS(doubleListGetHeadNode(pIceAgent->localCandidates, &pCurNode));
     while (pCurNode != NULL) {
@@ -1232,22 +1248,52 @@ STATUS iceAgentGatherCandidateTimerCallback(UINT32 timerId, UINT64 currentTime, 
             pendingCandidateCount++;
             if (pIceCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE) {
                 pendingSrflxCandidateCount++;
+            } else if (pIceCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_RELAYED &&
+                       pIceCandidate->pTurnConnectionTracker != NULL &&
+                       (pRelayAddress = turnConnectionGetRelayAddress(pIceCandidate->pTurnConnectionTracker->pTurnConnection)) != NULL) {
+                /* Check if any relay address has been obtained. */
+                CHK_STATUS(updateCandidateAddress(pIceCandidate, pRelayAddress));
+                CHK_STATUS(createIceCandidatePairs(pIceAgent, pIceCandidate, FALSE));
             }
         }
     }
 
-    // keep sending binding request if there is still pending srflx candidate
+    /* keep sending binding request if there is still pending srflx candidate */
     if (pendingSrflxCandidateCount > 0) {
         CHK_STATUS(iceAgentSendSrflxCandidateRequest(pIceAgent));
     }
 
-    // stop scheduling if there is no more pending candidate or if timeout is reached.
+    /* stop scheduling if there is no more pending candidate or if timeout is reached. */
     if (pendingCandidateCount == 0 || currentTime >= pIceAgent->candidateGatheringEndTime) {
         DLOGD("Candidate gathering completed.");
         stopScheduling = TRUE;
         pIceAgent->iceCandidateGatheringTimerTask = UINT32_MAX;
+    }
+
+    CHK_STATUS(doubleListGetHeadNode(pIceAgent->localCandidates, &pCurNode));
+    while (pCurNode != NULL && newLocalCandidateCount < ARRAY_SIZE(newLocalCandidates)) {
+        CHK_STATUS(doubleListGetNodeData(pCurNode, &data));
+        pCurNode = pCurNode->pNext;
+        pIceCandidate = (PIceCandidate) data;
+
+        if (pIceCandidate->state == ICE_CANDIDATE_STATE_VALID && !pIceCandidate->reported){
+            newLocalCandidates[newLocalCandidateCount++] = *pIceCandidate;
+            pIceCandidate->reported = TRUE;
+        }
+    }
+
+    MUTEX_UNLOCK(pIceAgent->lock);
+    locked = FALSE;
+
+    /* newLocalCandidateCount is at most ARRAY_SIZE(newLocalCandidates). Candidates not reported in this invocation
+     * will be reported in next invocation. */
+    for (i = 0; i < newLocalCandidateCount; ++i) {
+        CHK_STATUS(iceAgentReportNewLocalCandidate(pIceAgent, &newLocalCandidates[i]));
+    }
+
+    if (stopScheduling) {
         ATOMIC_STORE_BOOL(&pIceAgent->candidateGatheringFinished, TRUE);
-        // notify that candidate gathering is finished.
+        /* notify that candidate gathering is finished. */
         if (pIceAgent->iceAgentCallbacks.newLocalCandidateFn != NULL) {
             pIceAgent->iceAgentCallbacks.newLocalCandidateFn(pIceAgent->iceAgentCallbacks.customData, NULL);
         }
@@ -1310,6 +1356,7 @@ STATUS iceAgentInitSrflxCandidate(PIceAgent pIceAgent)
     STATUS retStatus = STATUS_SUCCESS;
     PDoubleListNode pCurNode = NULL;
     UINT64 data;
+    PIceServer pIceServer = NULL;
     PIceCandidate pCandidate = NULL, pNewCandidate = NULL;
     UINT32 j;
     BOOL locked = FALSE;
@@ -1325,9 +1372,12 @@ STATUS iceAgentInitSrflxCandidate(PIceAgent pIceAgent)
 
         if (pCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_HOST) {
             for (j = 0; j < pIceAgent->iceServersCount; j++) {
-                if (!pIceAgent->iceServers[j].isTurn) {
+                pIceServer = &pIceAgent->iceServers[j];
+                if (!pIceServer->isTurn && pIceServer->ipAddress.family == pCandidate->ipAddress.family) {
                     CHK((pNewCandidate = (PIceCandidate) MEMCALLOC(1, SIZEOF(IceCandidate))) != NULL,
                         STATUS_NOT_ENOUGH_MEMORY);
+                    generateJSONSafeString(pNewCandidate->id, ARRAY_SIZE(pNewCandidate->id));
+                    pNewCandidate->isRemote = FALSE;
 
                     // copy over host candidate's address to open up a new socket at that address.
                     pNewCandidate->ipAddress = pCandidate->ipAddress;
@@ -1383,82 +1433,48 @@ CleanUp:
     return retStatus;
 }
 
-STATUS iceAgentInitRelayCandidate(PIceAgent pIceAgent)
+STATUS iceAgentInitRelayCandidates(PIceAgent pIceAgent)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    PDoubleListNode pCurNode = NULL;
-    UINT64 data;
-    PIceCandidate pNewCandidate = NULL, pCandidate = NULL;
     UINT32 j, i;
     PKvsIpAddress pSocketAddrForTurn = NULL;
     BOOL locked = FALSE;
+    CHAR ipAddrStr[KVS_IP_ADDRESS_STRING_BUFFER_LEN];
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
-
     for (j = 0; j < pIceAgent->iceServersCount; j++) {
         if (pIceAgent->iceServers[j].isTurn) {
-
+            pSocketAddrForTurn = NULL;
             // if an VPN interface (isPointToPoint is TRUE) is found, use that instead
             for(i = 0; i < pIceAgent->localNetworkInterfaceCount; ++i) {
-                if(pIceAgent->localNetworkInterfaces[i].family == pIceAgent->iceServers[j].ipAddress.family &&
-                        (pSocketAddrForTurn == NULL || pIceAgent->localNetworkInterfaces[i].isPointToPoint)) {
+                // TODO: Stop skipping IPv6. Stun serialization and deserialization needs to be implemented properly first.
+                // Also, we need to handle the following kinds of relays:
+                //   1. IPv4-to-IPv6
+                //   2. IPv6-to-IPv6
+                //   3. IPv6-to-IPv4
+                // RFC: https://tools.ietf.org/html/rfc6156
+                if(pIceAgent->localNetworkInterfaces[i].family == KVS_IP_FAMILY_TYPE_IPV4 &&
+                    pIceAgent->localNetworkInterfaces[i].family == pIceAgent->iceServers[j].ipAddress.family &&
+                    (pSocketAddrForTurn == NULL || pIceAgent->localNetworkInterfaces[i].isPointToPoint)) {
                     pSocketAddrForTurn = &pIceAgent->localNetworkInterfaces[i];
                 }
             }
 
-            CHK(pSocketAddrForTurn != NULL, STATUS_TURN_CONNECTION_NO_HOST_INTERFACE_FOUND);
+            if (pSocketAddrForTurn == NULL) {
+                getIpAddrStr(&pIceAgent->iceServers[j].ipAddress, ipAddrStr, SIZEOF(ipAddrStr));
+                DLOGW("No suitable local interface found for turn server %s", ipAddrStr);
 
-            CHK((pNewCandidate = (PIceCandidate) MEMCALLOC(1, SIZEOF(IceCandidate))) != NULL,
-                STATUS_NOT_ENOUGH_MEMORY);
+            } else {
+                if (pIceAgent->iceServers[j].transport == KVS_SOCKET_PROTOCOL_UDP ||
+                    pIceAgent->iceServers[j].transport == KVS_SOCKET_PROTOCOL_NONE) {
+                    CHK_STATUS(iceAgentInitRelayCandidate(pIceAgent, pSocketAddrForTurn, j, KVS_SOCKET_PROTOCOL_UDP));
+                }
 
-            // copy over host candidate's address to open up a new socket at that address, because createSocketConnection
-            // would store port info into pNewCandidate->ipAddress
-            pNewCandidate->ipAddress = *pSocketAddrForTurn;
-            // open up a new socket at host candidate's ip address for relay candidate.
-            // the new port will be stored in pNewCandidate->ipAddress.port. And the Ip address will later be updated
-            // with the correct ip address once the STUN response is received. Relay candidate's socket is managed
-            // by TurnConnection struct.
-            CHK_STATUS(createSocketConnection(&pNewCandidate->ipAddress, &pIceAgent->iceServers[j].ipAddress, KVS_ICE_DEFAULT_TURN_PROTOCOL,
-                                              (UINT64) pIceAgent, incomingRelayedDataHandler, pIceAgent->kvsRtcConfiguration.sendBufSize,
-                                              &pNewCandidate->pSocketConnection));
-            // connectionListener will free the pSocketConnection at the end.
-            CHK_STATUS(connectionListenerAddConnection(pIceAgent->pConnectionListener,
-                                                       pNewCandidate->pSocketConnection));
-
-            pNewCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_RELAYED;
-            pNewCandidate->state = ICE_CANDIDATE_STATE_NEW;
-            pNewCandidate->iceServerIndex = j;
-            pNewCandidate->foundation = pIceAgent->foundationCounter++; // we dont generate candidates that have the same foundation.
-            pNewCandidate->priority = computeCandidatePriority(pNewCandidate);
-
-            CHK_STATUS(createTurnConnection(&pIceAgent->iceServers[j], pIceAgent->timerQueueHandle, TURN_CONNECTION_DATA_TRANSFER_MODE_SEND_INDIDATION,
-                                            KVS_ICE_DEFAULT_TURN_PROTOCOL, NULL, pNewCandidate->pSocketConnection, pIceAgent->pConnectionListener,
-                                            &pIceAgent->turnConnectionTracker.pTurnConnection));
-            pIceAgent->turnConnectionTracker.pRelayCandidate = pNewCandidate;
-
-            CHK_STATUS(doubleListInsertItemHead(pIceAgent->localCandidates, (UINT64) pNewCandidate));
-            pNewCandidate = NULL;
-
-            MUTEX_LOCK(pIceAgent->lock);
-            locked = TRUE;
-
-            /* add existing remote candidates to turn. Need to acuiqre lock because remoteCandidates can be mutated by
-             * iceAgentAddRemoteCandidate calls. */
-            CHK_STATUS(doubleListGetHeadNode(pIceAgent->remoteCandidates, &pCurNode));
-            while (pCurNode != NULL) {
-                CHK_STATUS(doubleListGetNodeData(pCurNode, &data));
-                pCurNode = pCurNode->pNext;
-                pCandidate = (PIceCandidate) data;
-
-                CHK_STATUS(turnConnectionAddPeer(pIceAgent->turnConnectionTracker.pTurnConnection, &pCandidate->ipAddress));
+                if (pIceAgent->iceServers[j].transport == KVS_SOCKET_PROTOCOL_TCP ||
+                    pIceAgent->iceServers[j].transport == KVS_SOCKET_PROTOCOL_NONE) {
+                    CHK_STATUS(iceAgentInitRelayCandidate(pIceAgent, pSocketAddrForTurn, j, KVS_SOCKET_PROTOCOL_TCP));
+                }
             }
-
-            MUTEX_UNLOCK(pIceAgent->lock);
-            locked = FALSE;
-
-            CHK_STATUS(turnConnectionStart(pIceAgent->turnConnectionTracker.pTurnConnection));
-            // use only first turn server for now. Stop the loop
-            break;
         }
     }
 
@@ -1470,11 +1486,98 @@ CleanUp:
 
     CHK_LOG_ERR(retStatus);
 
-    SAFE_MEMFREE(pNewCandidate);
-
     if (STATUS_FAILED(retStatus)) {
         iceAgentFatalError(pIceAgent, retStatus);
     }
+
+    return retStatus;
+}
+
+STATUS iceAgentInitRelayCandidate(PIceAgent pIceAgent, PKvsIpAddress pLocalInterface, UINT32 iceServerIndex, KVS_SOCKET_PROTOCOL protocol)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    PTurnConnectionTracker pCurrentTurnConnectionTracker = NULL;
+    PDoubleListNode pCurNode = NULL;
+    UINT64 data;
+    PIceCandidate pNewCandidate = NULL, pCandidate = NULL;
+    BOOL locked = FALSE;
+
+    CHK(pIceAgent != NULL, STATUS_NULL_ARG);
+    CHK_WARN(pIceAgent->turnConnectionTrackerCount < ARRAY_SIZE(pIceAgent->turnConnectionTrackers), retStatus,
+             "Cannot create more TurnConnection because max count of %u is reached",
+             ARRAY_SIZE(pIceAgent->turnConnectionTrackers));
+
+    pCurrentTurnConnectionTracker = &pIceAgent->turnConnectionTrackers[pIceAgent->turnConnectionTrackerCount];
+    CHK((pNewCandidate = (PIceCandidate) MEMCALLOC(1, SIZEOF(IceCandidate))) != NULL,
+        STATUS_NOT_ENOUGH_MEMORY);
+
+    generateJSONSafeString(pNewCandidate->id, ARRAY_SIZE(pNewCandidate->id));
+    pNewCandidate->isRemote = FALSE;
+
+    // copy over host candidate's address to open up a new socket at that address, because createSocketConnection
+    // would store port info into pNewCandidate->ipAddress
+    pNewCandidate->ipAddress = *pLocalInterface;
+    // open up a new socket at host candidate's ip address for relay candidate.
+    // the new port will be stored in pNewCandidate->ipAddress.port. And the Ip address will later be updated
+    // with the correct ip address once the STUN response is received. Relay candidate's socket is managed
+    // by TurnConnection struct.
+    CHK_STATUS(createSocketConnection(&pNewCandidate->ipAddress, &pIceAgent->iceServers[iceServerIndex].ipAddress, protocol,
+                                      (UINT64) pNewCandidate, incomingRelayedDataHandler, pIceAgent->kvsRtcConfiguration.sendBufSize,
+                                      &pNewCandidate->pSocketConnection));
+    // connectionListener will free the pSocketConnection at the end.
+    CHK_STATUS(connectionListenerAddConnection(pIceAgent->pConnectionListener,
+                                               pNewCandidate->pSocketConnection));
+
+    pNewCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_RELAYED;
+    pNewCandidate->state = ICE_CANDIDATE_STATE_NEW;
+    pNewCandidate->iceServerIndex = iceServerIndex;
+    pNewCandidate->foundation = pIceAgent->foundationCounter++; // we dont generate candidates that have the same foundation.
+    pNewCandidate->priority = computeCandidatePriority(pNewCandidate);
+
+    CHK_STATUS(createTurnConnection(&pIceAgent->iceServers[iceServerIndex], pIceAgent->timerQueueHandle, TURN_CONNECTION_DATA_TRANSFER_MODE_SEND_INDIDATION,
+                                    protocol, NULL, pNewCandidate->pSocketConnection, pIceAgent->pConnectionListener,
+                                    &pCurrentTurnConnectionTracker->pTurnConnection));
+    pCurrentTurnConnectionTracker->pRelayCandidate = pNewCandidate;
+    pCurrentTurnConnectionTracker->pIceAgent = pIceAgent;
+    pNewCandidate->pTurnConnectionTracker = pCurrentTurnConnectionTracker;
+
+    CHK_STATUS(doubleListInsertItemHead(pIceAgent->localCandidates, (UINT64) pNewCandidate));
+    pNewCandidate = NULL;
+
+    MUTEX_LOCK(pIceAgent->lock);
+    locked = TRUE;
+
+    /* add existing remote candidates to turn. Need to acquire lock because remoteCandidates can be mutated by
+     * iceAgentAddRemoteCandidate calls. */
+    CHK_STATUS(doubleListGetHeadNode(pIceAgent->remoteCandidates, &pCurNode));
+    while (pCurNode != NULL) {
+        CHK_STATUS(doubleListGetNodeData(pCurNode, &data));
+        pCurNode = pCurNode->pNext;
+        pCandidate = (PIceCandidate) data;
+
+        // TODO: Stop skipping IPv6. Since we're allowing IPv6 remote candidates from iceAgentAddRemoteCandidate for host candidates,
+        // it's possible to have a situation where the turn server uses IPv4 and the remote candidate uses IPv6.
+        if (IS_IPV4_ADDR(&pCandidate->ipAddress)) {
+            CHK_STATUS(turnConnectionAddPeer(pCurrentTurnConnectionTracker->pTurnConnection,
+                                             &pCandidate->ipAddress));
+        }
+    }
+
+    MUTEX_UNLOCK(pIceAgent->lock);
+    locked = FALSE;
+
+    CHK_STATUS(turnConnectionStart(pCurrentTurnConnectionTracker->pTurnConnection));
+    pIceAgent->turnConnectionTrackerCount++;
+
+CleanUp:
+
+    CHK_LOG_ERR(retStatus);
+
+    if (locked) {
+        MUTEX_UNLOCK(pIceAgent->lock);
+    }
+
+    SAFE_MEMFREE(pNewCandidate);
 
     return retStatus;
 }
@@ -1611,7 +1714,7 @@ STATUS iceAgentReadyStateSetup(PIceAgent pIceAgent)
     CHAR ipAddrStr[KVS_IP_ADDRESS_STRING_BUFFER_LEN];
     PDoubleListNode pCurNode = NULL;
     PIceCandidatePair pIceCandidatePair = NULL;
-    BOOL relayCandidateSelected = FALSE;
+    UINT32 i;
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
 
@@ -1636,24 +1739,26 @@ STATUS iceAgentReadyStateSetup(PIceAgent pIceAgent)
     CHK_STATUS(getIpAddrStr(&pIceAgent->pDataSendingIceCandidatePair->local->ipAddress,
                             ipAddrStr,
                             ARRAY_SIZE(ipAddrStr)));
-    DLOGD("Selected pair ip address: %s, port %u, local candidate type: %s",
-          ipAddrStr,
-          (UINT16) getInt16(pIceAgent->pDataSendingIceCandidatePair->local->ipAddress.port),
-          iceAgentGetCandidateTypeStr(pIceAgent->pDataSendingIceCandidatePair->local->iceCandidateType));
+    DLOGD("Selected pair %s_%s, local candidate type: %s. Round trip time %u ms",
+          pIceAgent->pDataSendingIceCandidatePair->local->id,
+          pIceAgent->pDataSendingIceCandidatePair->remote->id,
+          iceAgentGetCandidateTypeStr(pIceAgent->pDataSendingIceCandidatePair->local->iceCandidateType),
+          pIceAgent->pDataSendingIceCandidatePair->roundTripTime / HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
 
-    // no state timeout for ready state
+    /* no state timeout for ready state */
     pIceAgent->stateEndTime = INVALID_TIMESTAMP_VALUE;
 
-    relayCandidateSelected = IS_CANN_PAIR_SENDING_FROM_RELAYED(pIceAgent->pDataSendingIceCandidatePair);
-
-    // stop turn if it is not needed
-    if (!relayCandidateSelected && pIceAgent->turnConnectionTracker.pTurnConnection != NULL) {
-        DLOGD("Relayed candidate is not selected. Turn allocation will be freed");
-        CHK_STATUS(turnConnectionShutdown(pIceAgent->turnConnectionTracker.pTurnConnection, 0));
-        pIceAgent->turnConnectionTracker.freeTurnConnectionEndTime = GETTIME() + KVS_ICE_TURN_CONNECTION_SHUTDOWN_TIMEOUT;
-        CHK_STATUS(timerQueueAddTimer(pIceAgent->timerQueueHandle, KVS_ICE_DEFAULT_TIMER_START_DELAY, HUNDREDS_OF_NANOS_IN_A_SECOND,
-                                      iceAgentFreeTurnConnectionTimerCallback, (UINT64) &pIceAgent->turnConnectionTracker,
-                                      &pIceAgent->turnConnectionTracker.freeTurnConnectionTimerId));
+    /* shutdown turn allocations that are not needed. */
+    if (pIceAgent->turnConnectionTrackerCount > 0) {
+        DLOGD("Freeing Turn allocations that are not selected. Total turn allocation count %u", pIceAgent->turnConnectionTrackerCount);
+        for (i = 0; i < pIceAgent->turnConnectionTrackerCount; ++i) {
+            /* do not free selected candidate's turn allocation */
+            if (pIceAgent->turnConnectionTrackers[i].pRelayCandidate != pIceAgent->pDataSendingIceCandidatePair->local) {
+                CHK_STATUS(turnConnectionShutdown(pIceAgent->turnConnectionTrackers[i].pTurnConnection, 0));
+                pIceAgent->turnConnectionTrackers[i].pRelayCandidate->state = ICE_CANDIDATE_STATE_INVALID;
+            }
+        }
+        CHK_STATUS(iceAgentInvalidateCandidatePair(pIceAgent));
     }
 
 CleanUp:
@@ -1677,8 +1782,6 @@ STATUS iceAgentNominateCandidatePair(PIceAgent pIceAgent)
     PDoubleListNode pCurNode = NULL;
 
     CHK(pIceAgent != NULL, STATUS_NULL_ARG);
-
-    // Assume holding pIceAgent->lock
 
     // Assume holding pIceAgent->lock
     // do nothing if not controlling
@@ -1728,21 +1831,55 @@ CleanUp:
     return retStatus;
 }
 
+STATUS iceAgentInvalidateCandidatePair(PIceAgent pIceAgent)
+{
+    ENTERS();
+
+    STATUS retStatus = STATUS_SUCCESS;
+    PIceCandidatePair pIceCandidatePair = NULL;
+    PDoubleListNode pCurNode = NULL;
+
+    // Assume holding pIceAgent->lock
+    CHK(pIceAgent != NULL, STATUS_NULL_ARG);
+
+    CHK_STATUS(doubleListGetHeadNode(pIceAgent->iceCandidatePairs, &pCurNode));
+    while (pCurNode != NULL) {
+        pIceCandidatePair = (PIceCandidatePair) pCurNode->data;
+        pCurNode = pCurNode->pNext;
+
+        if (pIceCandidatePair->local->state != ICE_CANDIDATE_STATE_VALID) {
+            pIceCandidatePair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+        }
+    }
+
+CleanUp:
+
+    CHK_LOG_ERR(retStatus);
+
+    LEAVES();
+    return retStatus;
+}
+
 STATUS incomingRelayedDataHandler(UINT64 customData, PSocketConnection pSocketConnection, PBYTE pBuffer, UINT32 bufferLen,
                                   PKvsIpAddress pSrc, PKvsIpAddress pDest)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    PIceAgent pIceAgent = (PIceAgent) customData;
+    PIceCandidate pRelayedCandidate = (PIceCandidate) customData;
     // this should be more than enough. Usually the number of channel data in each tcp message is around 4
     TurnChannelData turnChannelData[DEFAULT_TURN_CHANNEL_DATA_BUFFER_SIZE];
     UINT32 turnChannelDataCount = ARRAY_SIZE(turnChannelData), i = 0;
 
-    CHK(pIceAgent != NULL && pSocketConnection != NULL, STATUS_NULL_ARG);
+    CHK(pRelayedCandidate != NULL && pSocketConnection != NULL, STATUS_NULL_ARG);
 
-    CHK_STATUS(turnConnectionIncomingDataHandler(pIceAgent->turnConnectionTracker.pTurnConnection, pBuffer, bufferLen, pSrc, pDest,
+    CHK_STATUS(turnConnectionIncomingDataHandler(pRelayedCandidate->pTurnConnectionTracker->pTurnConnection, pBuffer, bufferLen, pSrc, pDest,
                                                  turnChannelData, &turnChannelDataCount));
     for (; i < turnChannelDataCount; ++i) {
-        incomingDataHandler(customData, pSocketConnection, turnChannelData[i].data, turnChannelData[i].size, &turnChannelData[i].senderAddr, NULL);
+        incomingDataHandler((UINT64) pRelayedCandidate->pTurnConnectionTracker->pIceAgent,
+                            pSocketConnection,
+                            turnChannelData[i].data,
+                            turnChannelData[i].size,
+                            &turnChannelData[i].senderAddr,
+                            NULL);
     }
 
 CleanUp:
@@ -1805,18 +1942,32 @@ STATUS iceCandidateSerialize(PIceCandidate pIceCandidate, PCHAR pOutputData, PUI
                                  pIceCandidate->ipAddress.address[3],
                                  (UINT16) getInt16(pIceCandidate->ipAddress.port),
                                  iceAgentGetCandidateTypeStr(pIceCandidate->iceCandidateType));
-
-        CHK_WARN(amountWritten > 0, STATUS_INTERNAL_ERROR, "SNPRINTF failed");
-
-        if (pOutputData == NULL) {
-            *pOutputLength = ((UINT32) amountWritten) + 1; // +1 for null terminator
-        } else {
-            // amountWritten doesnt account for null char
-            CHK(amountWritten < (INT32) *pOutputLength, STATUS_BUFFER_TOO_SMALL);
-        }
-
     } else {
-        DLOGW("ipv6 not supported yet");
+        amountWritten = SNPRINTF(pOutputData,
+                                 pOutputData == NULL ? 0 : *pOutputLength,
+                                 "%u 1 udp %u %02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X "
+                                 "%d typ %s raddr ::/0 rport 0 generation 0 network-cost 999",
+                                 pIceCandidate->foundation,
+                                 pIceCandidate->priority,
+                                 pIceCandidate->ipAddress.address[0], pIceCandidate->ipAddress.address[1],
+                                 pIceCandidate->ipAddress.address[2], pIceCandidate->ipAddress.address[3],
+                                 pIceCandidate->ipAddress.address[4], pIceCandidate->ipAddress.address[5],
+                                 pIceCandidate->ipAddress.address[6], pIceCandidate->ipAddress.address[7],
+                                 pIceCandidate->ipAddress.address[8], pIceCandidate->ipAddress.address[9],
+                                 pIceCandidate->ipAddress.address[10], pIceCandidate->ipAddress.address[11],
+                                 pIceCandidate->ipAddress.address[12], pIceCandidate->ipAddress.address[13],
+                                 pIceCandidate->ipAddress.address[14], pIceCandidate->ipAddress.address[15],
+                                 (UINT16) getInt16(pIceCandidate->ipAddress.port),
+                                 iceAgentGetCandidateTypeStr(pIceCandidate->iceCandidateType));
+    }
+
+    CHK_WARN(amountWritten > 0, STATUS_INTERNAL_ERROR, "SNPRINTF failed");
+
+    if (pOutputData == NULL) {
+        *pOutputLength = ((UINT32) amountWritten) + 1; // +1 for null terminator
+    } else {
+        // amountWritten doesnt account for null char
+        CHK(amountWritten < (INT32) *pOutputLength, STATUS_BUFFER_TOO_SMALL);
     }
 
 CleanUp:
@@ -1840,7 +1991,8 @@ STATUS handleStunPacket(PIceAgent pIceAgent, PBYTE pBuffer, UINT32 bufferLen, PS
     PIceCandidate pIceCandidate = NULL;
     CHAR ipAddrStr[KVS_IP_ADDRESS_STRING_BUFFER_LEN], ipAddrStr2[KVS_IP_ADDRESS_STRING_BUFFER_LEN];
     PCHAR hexStr = NULL;
-    UINT32 hexStrLen = 0;
+    UINT32 hexStrLen = 0, checkSum = 0;
+    UINT64 requestSentTime = 0;
 
     // need to determine stunPacketType before deserializing because different password should be used depending on the packet type
     stunPacketType = (UINT16) getInt16(*((PUINT16) pBuffer));
@@ -1908,7 +2060,6 @@ STATUS handleStunPacket(PIceAgent pIceAgent, PBYTE pBuffer, UINT32 bufferLen, PS
 
                 pStunAttributeAddress = (PStunAttributeAddress) pStunAttr;
                 CHK_STATUS(updateCandidateAddress(pIceCandidate, &pStunAttributeAddress->address));
-                CHK_STATUS(iceAgentReportNewLocalCandidate(pIceAgent, pIceCandidate));
                 CHK(FALSE, retStatus);
             }
 
@@ -1941,7 +2092,16 @@ STATUS handleStunPacket(PIceAgent pIceAgent, PBYTE pBuffer, UINT32 bufferLen, PS
                 CHK(FALSE, retStatus);
             }
 
-            pIceCandidatePair->state = ICE_CANDIDATE_PAIR_STATE_SUCCEEDED;
+            if (pIceCandidatePair->state != ICE_CANDIDATE_PAIR_STATE_SUCCEEDED) {
+                checkSum = COMPUTE_CRC32(pBuffer + STUN_PACKET_TRANSACTION_ID_OFFSET, STUN_TRANSACTION_ID_LEN);
+                CHK_STATUS(hashTableGet(pIceCandidatePair->requestSentTime, checkSum, &requestSentTime));
+                pIceCandidatePair->roundTripTime = GETTIME() - requestSentTime;
+                DLOGD("Ice candidate pair %s_%s is connected. Round trip time: %" PRIu64 "ms",
+                      pIceCandidatePair->local->id,
+                      pIceCandidatePair->remote->id,
+                      pIceCandidatePair->roundTripTime / HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
+                pIceCandidatePair->state = ICE_CANDIDATE_PAIR_STATE_SUCCEEDED;
+            }
 
             break;
         case STUN_PACKET_TYPE_BINDING_INDICATION:
@@ -1994,7 +2154,7 @@ STATUS iceAgentCheckPeerReflexiveCandidate(PIceAgent pIceAgent, PKvsIpAddress pI
         findCandidateWithSocketConnection(pSocketConnection, pIceAgent->localCandidates, &pLocalIceCandidate);
         pLocalIceCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_PEER_REFLEXIVE;
         pLocalIceCandidate->ipAddress = *pIpAddress;
-        DLOGD("New local peer reflexive candidate found");
+        iceAgentLogNewCandidate(pLocalIceCandidate);
         CHK(FALSE, retStatus);
     }
 
@@ -2005,6 +2165,8 @@ STATUS iceAgentCheckPeerReflexiveCandidate(PIceAgent pIceAgent, PKvsIpAddress pI
     DLOGD("New remote peer reflexive candidate found");
 
     CHK((pIceCandidate = MEMCALLOC(1, SIZEOF(IceCandidate))) != NULL, STATUS_NOT_ENOUGH_MEMORY);
+    generateJSONSafeString(pIceCandidate->id, ARRAY_SIZE(pIceCandidate->id));
+    pIceCandidate->isRemote = TRUE;
     pIceCandidate->ipAddress = *pIpAddress;
     pIceCandidate->iceCandidateType = ICE_CANDIDATE_TYPE_PEER_REFLEXIVE;
     pIceCandidate->priority = priority;
@@ -2015,6 +2177,8 @@ STATUS iceAgentCheckPeerReflexiveCandidate(PIceAgent pIceAgent, PKvsIpAddress pI
     freeIceCandidateOnError = FALSE;
 
     CHK_STATUS(createIceCandidatePairs(pIceAgent, pIceCandidate, isRemote));
+
+    iceAgentLogNewCandidate(pIceCandidate);
 
 CleanUp:
 
@@ -2041,6 +2205,22 @@ CleanUp:
     return retStatus;
 }
 
+VOID iceAgentLogNewCandidate(PIceCandidate pIceCandidate)
+{
+    CHAR ipAddr[KVS_IP_ADDRESS_STRING_BUFFER_LEN];
+
+    if (pIceCandidate != NULL) {
+        getIpAddrStr(&pIceCandidate->ipAddress, ipAddr, ARRAY_SIZE(ipAddr));
+        DLOGD("New %s ice candidate discovered. Id: %s. Ip: %s:%u. Type: %s",
+              pIceCandidate->isRemote ? "remote" : "local",
+              pIceCandidate->id,
+              ipAddr,
+              (UINT16) getInt16(pIceCandidate->ipAddress.port),
+              iceAgentGetCandidateTypeStr(pIceCandidate->iceCandidateType)
+        );
+    }
+}
+
 STATUS updateCandidateAddress(PIceCandidate pIceCandidate, PKvsIpAddress pIpAddr)
 {
     STATUS retStatus = STATUS_SUCCESS;
@@ -2053,12 +2233,6 @@ STATUS updateCandidateAddress(PIceCandidate pIceCandidate, PKvsIpAddress pIpAddr
     pIceCandidate->ipAddress.port = pIpAddr->port;
 
     pIceCandidate->state = ICE_CANDIDATE_STATE_VALID;
-
-    if (pIceCandidate->iceCandidateType == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE) {
-        DLOGD("New server reflexive candidate found");
-    } else {
-        DLOGD("New relay candidate found");
-    }
 
 CleanUp:
 
@@ -2120,4 +2294,8 @@ PCHAR iceAgentGetCandidateTypeStr(ICE_CANDIDATE_TYPE candidateType) {
     }
 }
 
-
+UINT64 iceAgentGetCurrentTime(UINT64 customData)
+{
+    UNUSED_PARAM(customData);
+    return GETTIME();
+}

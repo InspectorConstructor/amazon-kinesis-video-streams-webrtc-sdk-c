@@ -122,12 +122,12 @@ STATUS masterMessageReceived(UINT64 customData, PReceivedSignalingMessage pRecei
     PSampleStreamingSession pSampleStreamingSession = NULL;
     UINT32 i;
     BOOL locked = FALSE;
+    ATOMIC_BOOL expected = FALSE;
 
     CHK(pSampleConfiguration != NULL, STATUS_NULL_ARG);
 
     MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
     locked = TRUE;
-
     // ice candidate message and offer message can come at any order. Therefore, if we see a new peerId, then create
     // a new SampleStreamingSession, which in turn creates a new peerConnection
     for (i = 0; i < pSampleConfiguration->streamingSessionCount && pSampleStreamingSession == NULL; ++i) {
@@ -146,17 +146,20 @@ STATUS masterMessageReceived(UINT64 customData, PReceivedSignalingMessage pRecei
                                                        pReceivedSignalingMessage->signalingMessage.peerClientId,
                                                        TRUE,
                                                        &pSampleStreamingSession));
+        pSampleStreamingSession->firstSdpMsgReceiveTime = GETTIME();
         pSampleConfiguration->sampleStreamingSessionList[pSampleConfiguration->streamingSessionCount++] = pSampleStreamingSession;
     }
 
-    MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
-    locked = FALSE;
-
     switch (pReceivedSignalingMessage->signalingMessage.messageType) {
         case SIGNALING_MESSAGE_TYPE_OFFER:
-            CHK_STATUS(handleOffer(pSampleConfiguration,
-                                   pSampleStreamingSession,
-                                   &pReceivedSignalingMessage->signalingMessage));
+            if (ATOMIC_COMPARE_EXCHANGE_BOOL(&pSampleStreamingSession->sdpOfferAnswerExchanged, &expected, TRUE)) {
+                CHK_STATUS(handleOffer(pSampleConfiguration,
+                                       pSampleStreamingSession,
+                                       &pReceivedSignalingMessage->signalingMessage));
+            } else {
+                DLOGD("Offer already received, ignore new offer from client id %s",
+                      pReceivedSignalingMessage->signalingMessage.peerClientId);
+            }
             break;
         case SIGNALING_MESSAGE_TYPE_ICE_CANDIDATE:
             CHK_STATUS(handleRemoteCandidate(pSampleStreamingSession, &pReceivedSignalingMessage->signalingMessage));
@@ -202,6 +205,7 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
 {
     STATUS retStatus = STATUS_SUCCESS;
     RtcSessionDescriptionInit offerSessionDescriptionInit;
+    BOOL locked = FALSE;
 
     CHK(pSampleConfiguration != NULL && pSignalingMessage != NULL, STATUS_NULL_ARG);
 
@@ -214,10 +218,17 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
     CHK_STATUS(setLocalDescription(pSampleStreamingSession->pPeerConnection, &pSampleStreamingSession->answerSessionDescriptionInit));
 
     if (!pSampleConfiguration->trickleIce) {
+        MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
+        locked = TRUE;
+
         while (!ATOMIC_LOAD_BOOL(&pSampleStreamingSession->candidateGatheringDone)) {
-            CHK_WARN(!ATOMIC_LOAD_BOOL(&pSampleStreamingSession->terminateFlag), STATUS_INTERNAL_ERROR, "application terminated and candidate gathering still not done");
-            CVAR_WAIT(pSampleConfiguration->cvar, pSampleConfiguration->sampleConfigurationObjLock, INFINITE_TIME_VALUE);
+            CHK_WARN(!ATOMIC_LOAD_BOOL(&pSampleStreamingSession->terminateFlag), STATUS_OPERATION_TIMED_OUT,
+                     "application terminated and candidate gathering still not done");
+            CVAR_WAIT(pSampleConfiguration->cvar, pSampleConfiguration->sampleConfigurationObjLock, 5 * HUNDREDS_OF_NANOS_IN_A_SECOND);
         }
+
+        MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+        locked = FALSE;
 
         DLOGD("Candidate collection done for non trickle ice");
         // get the latest local description once candidate gathering is done
@@ -226,6 +237,8 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
     }
 
     CHK_STATUS(respondWithAnswer(pSampleStreamingSession));
+    DLOGD("time taken to send answer %" PRIu64 " ms",
+          (GETTIME() - pSampleStreamingSession->firstSdpMsgReceiveTime) / HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
 
     if (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaThreadStarted)) {
         ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaThreadStarted, TRUE);
@@ -249,6 +262,10 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
 CleanUp:
 
     CHK_LOG_ERR(retStatus);
+
+    if (locked) {
+        MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+    }
 
     return retStatus;
 }
@@ -311,6 +328,7 @@ STATUS initializePeerConnection(PSampleConfiguration pSampleConfiguration, PRtcP
     RtcConfiguration configuration;
     UINT32 i, j, iceConfigCount, uriCount;
     PIceConfigInfo pIceConfigInfo;
+    const UINT32 maxTurnServer = 1;
 
     CHK(pSampleConfiguration != NULL && ppRtcPeerConnection != NULL, STATUS_NULL_ARG);
 
@@ -324,13 +342,22 @@ STATUS initializePeerConnection(PSampleConfiguration pSampleConfiguration, PRtcP
 
     if (pSampleConfiguration->useTurn) {
         // Set the URIs from the configuration
-        CHK_STATUS(signalingClientGetIceConfigInfoCount(pSampleConfiguration->signalingClientHandle, &iceConfigCount));
+        CHK_STATUS(awaitGetIceConfigInfoCount(pSampleConfiguration->signalingClientHandle, &iceConfigCount));
 
-        for (uriCount = 0, i = 0; i < iceConfigCount; i++) {
+        /* signalingClientGetIceConfigInfoCount can return more than one turn server. Use only one to optimize
+         * candidate gathering latency. But user can also choose to use more than 1 turn server. */
+        for (uriCount = 0, i = 0; i < maxTurnServer; i++) {
             CHK_STATUS(signalingClientGetIceConfigInfo(pSampleConfiguration->signalingClientHandle, i, &pIceConfigInfo));
             for (j = 0; j < pIceConfigInfo->uriCount; j++) {
                 CHECK(uriCount < MAX_ICE_SERVERS_COUNT);
-                STRNCPY(configuration.iceServers[uriCount + 1].urls, pIceConfigInfo->uris[j], MAX_ICE_CONFIG_URI_LEN);
+                /* - change url to "turn:ip:port?transport=udp" to do turn through UDP
+                 * - change url to "turn:ip:port?transport=tcp" will do turn through TCP/TLS currently,
+                 *   but later will be changed to plain tcp
+                 * - change url to "turns:ip:port?transport=tcp" to do turn through TCP/TLS
+                 * - "turns:ip:port?transport=udp" will just do UDP.
+                 * Currently if "transport=" is missing, ICE will try both UDP and TCP/TLS
+                 * By default use UDP since it's fastest. */
+                SNPRINTF(configuration.iceServers[uriCount + 1].urls, MAX_ICE_CONFIG_URI_LEN, "%s?transport=udp", pIceConfigInfo->uris[j]);
                 STRNCPY(configuration.iceServers[uriCount + 1].credential, pIceConfigInfo->password, MAX_ICE_CONFIG_CREDENTIAL_LEN);
                 STRNCPY(configuration.iceServers[uriCount + 1].username, pIceConfigInfo->userName, MAX_ICE_CONFIG_USER_NAME_LEN);
 
@@ -340,6 +367,32 @@ STATUS initializePeerConnection(PSampleConfiguration pSampleConfiguration, PRtcP
     }
 
     CHK_STATUS(createPeerConnection(&configuration, ppRtcPeerConnection));
+
+CleanUp:
+
+    return retStatus;
+}
+
+STATUS awaitGetIceConfigInfoCount(SIGNALING_CLIENT_HANDLE signalingClientHandle, PUINT32 pIceConfigInfoCount)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    UINT64 elapsed = 0;
+
+    CHK(IS_VALID_SIGNALING_CLIENT_HANDLE(signalingClientHandle) && pIceConfigInfoCount != NULL, STATUS_NULL_ARG);
+
+    while (TRUE) {
+        // Get the configuration count
+        CHK_STATUS(signalingClientGetIceConfigInfoCount(signalingClientHandle, pIceConfigInfoCount));
+
+        // Return OK if we have some ice configs
+        CHK(*pIceConfigInfoCount == 0, retStatus);
+
+        // Check for timeout
+        CHK_ERR(elapsed <= ASYNC_ICE_CONFIG_INFO_WAIT_TIMEOUT, STATUS_OPERATION_TIMED_OUT, "Couldn't retrieve ICE configurations in alotted time.");
+
+        THREAD_SLEEP(ICE_CONFIG_INFO_POLL_PERIOD);
+        elapsed += ICE_CONFIG_INFO_POLL_PERIOD;
+    }
 
 CleanUp:
 
@@ -614,7 +667,9 @@ STATUS createSampleConfiguration(PCHAR channelName, SIGNALING_CHANNEL_ROLE_TYPE 
     pSampleConfiguration->channelInfo.pTags = NULL;
     pSampleConfiguration->channelInfo.channelType = SIGNALING_CHANNEL_TYPE_SINGLE_MASTER;
     pSampleConfiguration->channelInfo.channelRoleType = roleType;
-    pSampleConfiguration->channelInfo.cachingEndpoint = FALSE;
+    pSampleConfiguration->channelInfo.cachingPolicy = SIGNALING_API_CALL_CACHE_TYPE_DESCRIBE_GETENDPOINT;
+    pSampleConfiguration->channelInfo.cachingPeriod = SIGNALING_API_CALL_CACHE_TTL_SENTINEL_VALUE;
+    pSampleConfiguration->channelInfo.asyncIceServerConfig = TRUE;
     pSampleConfiguration->channelInfo.retry = TRUE;
     pSampleConfiguration->channelInfo.reconnect = TRUE;
     pSampleConfiguration->channelInfo.pCertPath = pSampleConfiguration->pCaCertPath;
@@ -754,6 +809,8 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
     }
 
 CleanUp:
+
+    CHK_LOG_ERR(retStatus);
 
     if (locked) {
         MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);

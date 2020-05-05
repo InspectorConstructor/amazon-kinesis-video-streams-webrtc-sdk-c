@@ -1,5 +1,7 @@
 #include "Samples.h"
 
+extern PSampleConfiguration gSampleConfiguration;
+
 INT32 main(INT32 argc, CHAR *argv[])
 {
     STATUS retStatus = STATUS_SUCCESS;
@@ -24,12 +26,14 @@ INT32 main(INT32 argc, CHAR *argv[])
         printf("[KVS Viewer] createSampleConfiguration(): operation returned status code: 0x%08x \n", retStatus);
         goto CleanUp;
     }
+    gSampleConfiguration = pSampleConfiguration;
+
     printf("[KVS Viewer] Created signaling channel %s\n", (argc > 1 ? argv[1] : SAMPLE_CHANNEL_NAME));
 
     // Initialize KVS WebRTC. This must be done before anything else, and must only be done once.
     retStatus = initKvsWebRtc();
     if(retStatus != STATUS_SUCCESS) {
-        printf("[KVS Master] initKvsWebRtc(): operation returned status code: 0x%08x \n", retStatus);
+        printf("[KVS Viewer] initKvsWebRtc(): operation returned status code: 0x%08x \n", retStatus);
         goto CleanUp;
     }
 
@@ -37,7 +41,7 @@ INT32 main(INT32 argc, CHAR *argv[])
 
     pSampleConfiguration->signalingClientCallbacks.messageReceivedFn = viewerMessageReceived;
 
-    strcpy(pSampleConfiguration->clientInfo.clientId, SAMPLE_VIEWER_CLIENT_ID);
+    sprintf(pSampleConfiguration->clientInfo.clientId, "%s_%u", SAMPLE_VIEWER_CLIENT_ID, RAND() % UINT32_MAX);
 
     retStatus = createSignalingClientSync(&pSampleConfiguration->clientInfo, &pSampleConfiguration->channelInfo,
                                           &pSampleConfiguration->signalingClientCallbacks, pSampleConfiguration->pCredentialProvider,
@@ -48,6 +52,15 @@ INT32 main(INT32 argc, CHAR *argv[])
     }
 
     printf("[KVS Viewer] Signaling client created successfully\n");
+
+    // Enable the processing of the messages
+    retStatus = signalingClientConnectSync(pSampleConfiguration->signalingClientHandle);
+    if(retStatus != STATUS_SUCCESS) {
+        printf("[KVS Viewer] signalingClientConnectSync(): operation returned status code: 0x%08x \n", retStatus);
+        goto CleanUp;
+    }
+
+    printf("[KVS Viewer] Signaling client connection to socket established\n");
 
     // Initialize streaming session
     MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
@@ -64,15 +77,6 @@ INT32 main(INT32 argc, CHAR *argv[])
 
     MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
     locked = FALSE;
-
-    // Enable the processing of the messages
-    retStatus = signalingClientConnectSync(pSampleConfiguration->signalingClientHandle);
-    if(retStatus != STATUS_SUCCESS) {
-        printf("[KVS Viewer] signalingClientConnectSync(): operation returned status code: 0x%08x \n", retStatus);
-        goto CleanUp;
-    }
-
-    printf("[KVS Viewer] Signaling client connection to socket established\n");
 
     memset(&offerSessionDescriptionInit, 0x00, SIZEOF(RtcSessionDescriptionInit));
 
@@ -96,6 +100,26 @@ INT32 main(INT32 argc, CHAR *argv[])
     if(retStatus != STATUS_SUCCESS) {
         printf("[KVS Viewer] transceiverOnFrame(): operation returned status code: 0x%08x \n", retStatus);
         goto CleanUp;
+    }
+
+    if (!pSampleConfiguration->trickleIce) {
+        printf("[KVS Viewer] Non trickle ice. Wait for Candidate collection to complete\n");
+        MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
+        locked = TRUE;
+
+        while (!ATOMIC_LOAD_BOOL(&pSampleStreamingSession->candidateGatheringDone)) {
+            CHK_WARN(!ATOMIC_LOAD_BOOL(&pSampleStreamingSession->terminateFlag), STATUS_OPERATION_TIMED_OUT,
+                     "application terminated and candidate gathering still not done");
+            CVAR_WAIT(pSampleConfiguration->cvar, pSampleConfiguration->sampleConfigurationObjLock, 5 * HUNDREDS_OF_NANOS_IN_A_SECOND);
+        }
+
+        MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+        locked = FALSE;
+
+        printf("[KVS Viewer] Candidate collection completed\n");
+        // get the latest local description once candidate gathering is done
+        CHK_STATUS(peerConnectionGetCurrentLocalDescription(pSampleStreamingSession->pPeerConnection,
+                                                            &offerSessionDescriptionInit));
     }
 
     printf("[KVS Viewer] Generating JSON of session description....");
@@ -130,8 +154,10 @@ INT32 main(INT32 argc, CHAR *argv[])
         goto CleanUp;
     }
 
-    // Block forever
-    THREAD_SLEEP(MAX_UINT64);
+    // Block until interrupted
+    while (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->interrupted)) {
+        THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_SECOND);
+    }
 
 CleanUp:
 

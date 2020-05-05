@@ -167,7 +167,7 @@ STATUS sendPacketToRtpReceiver(PKvsPeerConnection pKvsPeerConnection, PBYTE pBuf
     PKvsRtpTransceiver pTransceiver;
     UINT64 item;
     UINT32 ssrc;
-    PRtpPacket pRtpPacket;
+    PRtpPacket pRtpPacket = NULL;
     PBYTE pPayload = NULL;
     BOOL ownedByJitterBuffer = FALSE;
 
@@ -184,7 +184,6 @@ STATUS sendPacketToRtpReceiver(PKvsPeerConnection pKvsPeerConnection, PBYTE pBuf
         if (pTransceiver->jitterBufferSsrc == ssrc) {
             CHK(NULL != (pPayload = (PBYTE) MEMALLOC(bufferLen)), STATUS_NOT_ENOUGH_MEMORY);
             MEMCPY(pPayload, pBuffer, bufferLen);
-            ownedByJitterBuffer = FALSE;
             CHK_STATUS(createRtpPacketFromBytes(pPayload, bufferLen, &pRtpPacket));
             CHK_STATUS(jitterBufferPush(pTransceiver->pJitterBuffer, pRtpPacket));
             ownedByJitterBuffer = TRUE;
@@ -195,10 +194,10 @@ STATUS sendPacketToRtpReceiver(PKvsPeerConnection pKvsPeerConnection, PBYTE pBuf
 
     DLOGW("No transceiver to handle inbound ssrc %u", ssrc);
 
-
 CleanUp:
     if (!ownedByJitterBuffer) {
-        MEMFREE(pPayload);
+        SAFE_MEMFREE(pPayload);
+        freeRtpPacket(&pRtpPacket);
         CHK_LOG_ERR(retStatus);
     }
     return retStatus;
@@ -661,6 +660,36 @@ CleanUp:
     if (locked) {
         MUTEX_UNLOCK(pKvsPeerConnection->peerConnectionObjLock);
     }
+
+    LEAVES();
+    return retStatus;
+}
+
+STATUS peerConnectionGetLocalDescription(PRtcPeerConnection pRtcPeerConnection, PRtcSessionDescriptionInit pRtcSessionDescriptionInit)
+{
+    ENTERS();
+    STATUS retStatus = STATUS_SUCCESS;
+    SessionDescription sessionDescription;
+    UINT32 deserializeLen = 0;
+    PKvsPeerConnection pKvsPeerConnection = (PKvsPeerConnection) pRtcPeerConnection;
+
+    CHK(pRtcPeerConnection != NULL && pRtcSessionDescriptionInit != NULL, STATUS_NULL_ARG);
+
+    MEMSET(&sessionDescription, 0x00, SIZEOF(SessionDescription));
+
+    if (pKvsPeerConnection->isOffer) {
+        pRtcSessionDescriptionInit->type = SDP_TYPE_OFFER;
+    } else {
+        pRtcSessionDescriptionInit->type = SDP_TYPE_ANSWER;
+    }
+
+    CHK_STATUS(populateSessionDescription(pKvsPeerConnection, &(pKvsPeerConnection->remoteSessionDescription), &sessionDescription));
+    CHK_STATUS(deserializeSessionDescription(&sessionDescription, NULL, &deserializeLen));
+    CHK(deserializeLen <= MAX_SESSION_DESCRIPTION_INIT_SDP_LEN, STATUS_NOT_ENOUGH_MEMORY);
+
+    CHK_STATUS(deserializeSessionDescription(&sessionDescription, pRtcSessionDescriptionInit->sdp, &deserializeLen));
+
+CleanUp:
 
     LEAVES();
     return retStatus;
