@@ -33,6 +33,9 @@ extern "C" {
 #define DATA_CHANNEL_HASH_TABLE_BUCKET_COUNT            200
 #define DATA_CHANNEL_HASH_TABLE_BUCKET_LENGTH           2
 
+// Environment variable to display SDPs
+#define DEBUG_LOG_SDP                                                     ((PCHAR) "DEBUG_LOG_SDP")
+
 typedef enum {
     RTC_RTX_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE = 1,
     RTC_RTX_CODEC_VP8 = 2,
@@ -55,6 +58,9 @@ typedef struct {
 
     CHAR localIceUfrag[LOCAL_ICE_UFRAG_LEN + 1];
     CHAR localIcePwd[LOCAL_ICE_PWD_LEN + 1];
+
+    CHAR remoteIceUfrag[LOCAL_ICE_UFRAG_LEN + 1];
+    CHAR remoteIcePwd[LOCAL_ICE_PWD_LEN + 1];
 
     CHAR localCNAME[LOCAL_CNAME_LEN + 1];
 
@@ -86,9 +92,11 @@ typedef struct {
 
     UINT64 onConnectionStateChangeCustomData;
     RtcOnConnectionStateChange onConnectionStateChange;
-    RTC_PEER_CONNECTION_STATE previousConnectionState;
+    RTC_PEER_CONNECTION_STATE connectionState;
 
     UINT16 MTU;
+
+    NullableBool canTrickleIce;
 } KvsPeerConnection, *PKvsPeerConnection;
 
 typedef struct {
@@ -104,6 +112,7 @@ VOID onSctpSessionDataChannelMessage(UINT64, UINT32, BOOL, PBYTE, UINT32);
 VOID onSctpSessionDataChannelOpen(UINT64, UINT32, PBYTE, UINT32);
 
 STATUS sendPacketToRtpReceiver(PKvsPeerConnection, PBYTE, UINT32);
+STATUS changePeerConnectionState(PKvsPeerConnection, RTC_PEER_CONNECTION_STATE);
 
 #ifdef  __cplusplus
 }
