@@ -1,5 +1,6 @@
 #define LOG_CLASS "WebRtcSamples"
 #include "Samples.h"
+const char*  DEFAULT_CACHE_FILE_PATH="./.SignalingCache_v0";
 
 PSampleConfiguration gSampleConfiguration = NULL;
 

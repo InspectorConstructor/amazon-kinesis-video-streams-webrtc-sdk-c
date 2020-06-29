@@ -12,7 +12,10 @@ extern "C" {
 
 /* If SignalingFileCacheEntry layout is changed, change the version in cache file name so we wont read from older
  * cache file. */
-#define DEFAULT_CACHE_FILE_PATH                         "./.SignalingCache_v0"
+// Simplisafe, change #define to extern, so that this path can be modified by camera app
+//#define DEFAULT_CACHE_FILE_PATH                         "./.SignalingCache_v0"
+extern const char*  DEFAULT_CACHE_FILE_PATH;
+
 #define MAX_SIGNALING_CACHE_ENTRY_TIMESTAMP_STR_LEN     10
 /* Max length for a serialized signaling cache entry. 8 accounts for 6 commas and 1 newline
  * char and null terminator */
