@@ -36,7 +36,7 @@ function(build_dependency lib_name)
   # library building cmake.
   set(build_args ${ARGN})
 
-  file(REMOVE_RECURSE ${KINESIS_VIDEO_OPEN_SOURCE_SRC}/lib${lib_name})
+  #  file(REMOVE_RECURSE ${KINESIS_VIDEO_OPEN_SOURCE_SRC}/lib${lib_name})
 
   # build library
   configure_file(
@@ -59,7 +59,7 @@ function(build_dependency lib_name)
     message(FATAL_ERROR "CMake step for lib${lib_name} failed: ${result}")
   endif()
 
-  file(REMOVE_RECURSE ${KINESIS_VIDEO_OPEN_SOURCE_SRC}/lib${lib_name})
+  #file(REMOVE_RECURSE ${KINESIS_VIDEO_OPEN_SOURCE_SRC}/lib${lib_name})
 endfunction()
 
 function(enableSanitizer SANITIZER)
